@@ -1019,7 +1019,7 @@ impl TerminalBuilder {
             completion_tx: None,
             term,
             term_config: config,
-            output_processor: Processor::<StdSyncHandler>::new(),
+            output_processor: None,
             title_override: None,
             events: VecDeque::with_capacity(10),
             last_content: Content {
@@ -1306,7 +1306,7 @@ impl TerminalBuilder {
                 completion_tx,
                 term,
                 term_config: config,
-                output_processor: Processor::<StdSyncHandler>::new(),
+                output_processor: None,
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
@@ -1506,7 +1506,13 @@ pub struct Terminal {
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
-    output_processor: Processor<StdSyncHandler>,
+    /// Parses bytes injected through [`Terminal::write_output`]. PTY output is
+    /// parsed by the `alacritty_terminal` event loop instead, so this stays
+    /// `None` until something actually injects bytes. A `vte::ansi::Processor`
+    /// reserves its synchronized-update buffer up front, and a terminal that has
+    /// finished its command can no longer receive input, so the reservation must
+    /// not outlive the command — see [`Terminal::release_pty_resources`].
+    output_processor: Option<Processor<StdSyncHandler>>,
     events: VecDeque<InternalEvent>,
     /// This is only used for mouse mode cell change detection
     last_mouse: Option<(Point, SelectionSide)>,
@@ -1965,7 +1971,9 @@ impl Terminal {
         let converted = convert_lf_to_crlf(bytes, &mut previous_byte_was_cr);
 
         let mut term = self.term.lock();
-        self.output_processor.advance(&mut *term, &converted);
+        self.output_processor
+            .get_or_insert_with(Processor::<StdSyncHandler>::new)
+            .advance(&mut *term, &converted);
         drop(term);
         self.detect_init_command_startup_marker();
         cx.emit(Event::Wakeup);
@@ -3053,6 +3061,9 @@ impl Terminal {
 
     /// Releases live PTY resources while retaining process metadata and buffered output.
     ///
+    /// The parser used by [`Terminal::write_output`] is dropped too, because no
+    /// further output can arrive; it is recreated if something injects bytes again.
+    ///
     /// Calling this method after the resources have already been released is a no-op.
     pub fn release_pty_resources(&mut self) {
         let TerminalType::Pty { resources, info } = &mut self.terminal_type else {
@@ -3063,6 +3074,12 @@ impl Terminal {
             return;
         };
         let info = info.clone();
+
+        // The PTY is gone, so no further output can reach the parser. Drop it,
+        // and with it the buffer `vte` reserves for synchronized updates: the
+        // terminal itself outlives the command, because the UI keeps it around to
+        // render the output that has already been captured.
+        self.output_processor = None;
 
         pty_tx.shutdown();
         info.terminate_child_process();
